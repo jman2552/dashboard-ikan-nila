@@ -1,0 +1,38 @@
+# ================================================
+# .gitignore — Pratest RF / Dashboard Ikan Nila
+# ================================================
+
+# WAJIB: Jangan upload credentials!
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+env/
+.venv/
+
+# Model (terlalu besar untuk GitHub, gunakan Git LFS jika perlu)
+model/*.pkl
+
+# Data mentah & olahan
+data/raw/*.csv
+data/processed/*.csv
+
+# Output evaluasi
+evaluation/*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

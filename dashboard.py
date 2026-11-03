@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 _DEFAULT_URL = "https://amonia-projet-ta-default-rtdb.asia-southeast1.firebasedatabase.app"
-_DEFAULT_KEY = base64.b64decode("dXVkRHd6Smk1bGxJVDI3NVBreTdPcVSTRjNqTlk0aHNrMGpQSVAyUA==").decode("utf-8")
+_DEFAULT_KEY = "uudDwzJi5llIT275Pky7OqSSF3jNY4hsk0jPIP2P"
 
 def get_firebase_credentials():
     # 1. Dari Streamlit Secrets jika diisi

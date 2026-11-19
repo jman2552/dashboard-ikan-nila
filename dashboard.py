@@ -106,6 +106,22 @@ def konversi_waktu(ts_raw):
     except Exception:
         return pd.to_datetime(ts_raw, errors="coerce")
 
+def decode_firebase_push_key_timestamp(push_key):
+    """Decode timestamp tersembunyi dari Firebase push key (8 karakter pertama = epoch ms)."""
+    if not push_key or not isinstance(push_key, str) or len(push_key) < 8:
+        return None
+    try:
+        PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+        timestamp = 0
+        for i in range(8):
+            char = push_key[i]
+            if char not in PUSH_CHARS:
+                return None
+            timestamp = timestamp * 64 + PUSH_CHARS.index(char)
+        return pd.to_datetime(timestamp, unit="ms", utc=True).tz_convert("Asia/Jakarta")
+    except Exception:
+        return None
+
 
 @st.cache_data(ttl=15)
 def ambil_data_firebase(limit_history=100):
@@ -117,16 +133,19 @@ def ambil_data_firebase(limit_history=100):
     df_history   = pd.DataFrame()
 
     try:
+        # 1. Ambil data current
         url_current = f"{FIREBASE_URL}/device/current.json"
         res_curr = requests.get(url_current, params={"auth": FIREBASE_KEY}, timeout=10)
         if res_curr.status_code == 200:
             current_data = res_curr.json()
 
+        # 2. Ambil status power
         url_power = f"{FIREBASE_URL}/device/power.json"
         res_pow = requests.get(url_power, params={"auth": FIREBASE_KEY}, timeout=8)
         if res_pow.status_code == 200:
             power_data = res_pow.json()
 
+        # 3. Ambil data history
         url_hist = f"{FIREBASE_URL}/device/history.json"
         params_hist = {"auth": FIREBASE_KEY}
         if limit_history and limit_history > 0:
@@ -145,9 +164,32 @@ def ambil_data_firebase(limit_history=100):
                         rows.append(row)
                 if rows:
                     df_history = pd.DataFrame(rows)
-                    if "ts" in df_history.columns:
-                        df_history["waktu_wib"] = df_history["ts"].apply(konversi_waktu)
-                        df_history = df_history.sort_values("waktu_wib").reset_index(drop=True)
+
+                    # ── NORMALISASI NAMA KOLOM (sesuai data Firebase Anda) ──
+                    rename_map = {}
+                    if "suhu_c" in df_history.columns:
+                        rename_map["suhu_c"] = "temp"
+                    if "nh3_ppm" in df_history.columns:
+                        rename_map["nh3_ppm"] = "nh3"
+                    if rename_map:
+                        df_history = df_history.rename(columns=rename_map)
+
+                    # ── BUAT KOLOM waktu_wib DARI BEBERAPA SUMBER ──
+                    timestamp_found = False
+                    for col_name in ["ts", "waktu", "timestamp", "time", "created_at"]:
+                        if col_name in df_history.columns:
+                            df_history["waktu_wib"] = df_history[col_name].apply(konversi_waktu)
+                            timestamp_found = True
+                            break
+
+                    if not timestamp_found:
+                        # Fallback: decode dari Firebase push key
+                        df_history["waktu_wib"] = df_history["firebase_key"].apply(
+                            decode_firebase_push_key_timestamp
+                        )
+
+                    # Sort berdasarkan waktu
+                    df_history = df_history.sort_values("waktu_wib").reset_index(drop=True)
 
         return current_data, power_data, df_history, None
 
@@ -161,43 +203,32 @@ def ambil_data_firebase(limit_history=100):
 PRESET_OPSI = ["Semua Data", "Hari Ini", "7 Hari Terakhir", "30 Hari Terakhir", "Custom (Kalender)"]
 
 def filter_history(df, mode, picked_dates):
-    """
-    Filter history_df berdasarkan rentang waktu.
-    - mode: salah satu dari PRESET_OPSI
-    - picked_dates: tuple (start_date, end_date) dari st.date_input (mode Custom)
-    Mengembalikan DataFrame yang sudah difilter + label deskripsi rentang.
-    """
     if df.empty or "waktu_wib" not in df.columns:
         return df, "Tidak ada data waktu"
 
-    # Buang baris tanpa waktu valid
     df = df.dropna(subset=["waktu_wib"]).copy()
     if df.empty:
         return df, "Tidak ada data waktu valid"
 
     now_wib = pd.Timestamp.now(tz="Asia/Jakarta")
-    today_wib = now_wib.normalize()  # jam 00:00 hari ini WIB
+    today_wib = now_wib.normalize()
 
     if mode == "Semua Data":
         return df, "Seluruh data riwayat"
-
     if mode == "Hari Ini":
         mask = df["waktu_wib"] >= today_wib
         label = f"Hari ini ({today_wib.strftime('%d %b %Y')})"
         return df[mask].reset_index(drop=True), label
-
     if mode == "7 Hari Terakhir":
         batas = today_wib - pd.Timedelta(days=6)
         mask = df["waktu_wib"] >= batas
         label = f"7 hari terakhir ({batas.strftime('%d %b')} → {today_wib.strftime('%d %b %Y')})"
         return df[mask].reset_index(drop=True), label
-
     if mode == "30 Hari Terakhir":
         batas = today_wib - pd.Timedelta(days=29)
         mask = df["waktu_wib"] >= batas
         label = f"30 hari terakhir ({batas.strftime('%d %b')} → {today_wib.strftime('%d %b %Y')})"
         return df[mask].reset_index(drop=True), label
-
     if mode == "Custom (Kalender)":
         if not isinstance(picked_dates, (tuple, list)) or len(picked_dates) != 2:
             return df, "Pilih tanggal awal & akhir"
@@ -234,7 +265,6 @@ with st.sidebar:
 
     picked_dates = None
     if mode_filter == "Custom (Kalender)":
-        # Simpan pilihan kalender agar tidak reset saat auto-refresh
         if "custom_range" not in st.session_state:
             hari_ini = date.today()
             st.session_state.custom_range = (hari_ini - timedelta(days=7), hari_ini)
@@ -288,7 +318,7 @@ if not current and history_df_full.empty:
 # ── Terapkan Filter Rentang Waktu ────────────────────────────
 history_df, rentang_label = filter_history(history_df_full, mode_filter, picked_dates)
 
-# ── Persiapan Data Terkini (tetap pakai /device/current, tidak terpengaruh filter) ─
+# ── Persiapan Data Terkini ───────────────────────────────────
 latest_temp = None
 latest_ph   = None
 latest_nh3  = None
@@ -299,13 +329,13 @@ latest_pred = None
 latest_status = None
 
 if current:
-    latest_temp = current.get("temp")
+    latest_temp = current.get("temp") or current.get("suhu_c")
     latest_ph   = current.get("ph")
-    latest_nh3  = current.get("nh3")
+    latest_nh3  = current.get("nh3") or current.get("nh3_ppm")
     latest_humi = current.get("humi")
     latest_firmware = current.get("firmware", "-")
     latest_status   = current.get("status")
-    ts_val = current.get("ts")
+    ts_val = current.get("ts") or current.get("waktu")
     if ts_val:
         dt_curr = konversi_waktu(ts_val)
         latest_ts_str = dt_curr.strftime("%d %b %Y, %H:%M:%S WIB") if pd.notna(dt_curr) else str(ts_val)
@@ -335,20 +365,17 @@ ada_nh3 = latest_nh3 is not None or ("nh3" in history_df_full.columns and histor
 
 cols = st.columns(5)
 with cols[0]:
-    st.metric(label="🌡️ Suhu Air",
-              value=f"{float(latest_temp):.2f} °C" if latest_temp is not None else "-")
+    st.metric(label="🌡️ Suhu Air", value=f"{float(latest_temp):.2f} °C" if latest_temp is not None else "-")
 with cols[1]:
     if ada_ph:
-        st.metric(label="🧪 Derajat Keasaman (pH)",
-                  value=f"{float(latest_ph):.2f}" if latest_ph is not None else "-")
+        st.metric(label="🧪 Derajat Keasaman (pH)", value=f"{float(latest_ph):.2f}" if latest_ph is not None else "-")
     elif latest_humi is not None:
         st.metric(label="💧 Kelembapan", value=f"{float(latest_humi):.1f} %")
     else:
         st.metric(label="🧪 pH Air", value="-")
 with cols[2]:
     if ada_nh3:
-        st.metric(label="💨 Amonia (NH3)",
-                  value=f"{float(latest_nh3):.3f} ppm" if latest_nh3 is not None else "0.000 ppm")
+        st.metric(label="💨 Amonia (NH3)", value=f"{float(latest_nh3):.3f} ppm" if latest_nh3 is not None else "0.000 ppm")
     elif latest_pred is not None:
         st.metric(label="🔮 Prediksi Suhu", value=f"{float(latest_pred):.2f} °C")
     else:
@@ -388,102 +415,58 @@ else:
     if "temp" in history_df.columns and history_df["temp"].notna().any():
         fig_temp = go.Figure()
         fig_temp.add_trace(go.Scatter(
-            x=x_axis, y=history_df["temp"],
-            mode="lines+markers", name="Suhu Aktual (°C)",
+            x=x_axis, y=history_df["temp"], mode="lines+markers", name="Suhu Aktual (°C)",
             line=dict(color="#48cae4", width=2), marker=dict(size=4),
             hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>Suhu: %{y:.2f} °C<extra></extra>"
         ))
         if "predicted_val" in history_df.columns and history_df["predicted_val"].notna().any():
             df_pred_plot = history_df.dropna(subset=["predicted_val"])
             fig_temp.add_trace(go.Scatter(
-                x=df_pred_plot["waktu_wib"], y=df_pred_plot["predicted_val"],
-                mode="lines", name="Prediksi Suhu (°C)",
+                x=df_pred_plot["waktu_wib"], y=df_pred_plot["predicted_val"], mode="lines", name="Prediksi Suhu (°C)",
                 line=dict(color="#f77f00", width=2, dash="dash"),
                 hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>Prediksi: %{y:.2f} °C<extra></extra>"
             ))
-        fig_temp.add_hrect(
-            y0=28.0, y1=33.0,
-            fillcolor="rgba(46, 196, 182, 0.08)", line_width=0,
-            annotation_text="Rentang Suhu Ideal (28°C - 33°C)",
-            annotation_position="top left", annotation_font_color="#2ec4b6", annotation_font_size=11
-        )
-        fig_temp.update_layout(
-            title="Dinamika Suhu Kolam (°C)",
-            paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
-            height=320, font=dict(color="#8da9c4"),
-            xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
-            yaxis=dict(gridcolor="#3a506b", title="Suhu (°C)"),
-            hovermode="x unified"
-        )
+        fig_temp.add_hrect(y0=28.0, y1=33.0, fillcolor="rgba(46, 196, 182, 0.08)", line_width=0,
+            annotation_text="Rentang Suhu Ideal (28°C - 33°C)", annotation_position="top left", annotation_font_color="#2ec4b6", annotation_font_size=11)
+        fig_temp.update_layout(title="Dinamika Suhu Kolam (°C)", paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
+            height=320, font=dict(color="#8da9c4"), xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
+            yaxis=dict(gridcolor="#3a506b", title="Suhu (°C)"), hovermode="x unified")
         st.plotly_chart(fig_temp, use_container_width=True, key="chart_temp")
 
     # 2. Grafik pH
     if "ph" in history_df.columns and history_df["ph"].notna().any():
         fig_ph = go.Figure()
-        fig_ph.add_trace(go.Scatter(
-            x=x_axis, y=history_df["ph"],
-            mode="lines+markers", name="pH Air",
+        fig_ph.add_trace(go.Scatter(x=x_axis, y=history_df["ph"], mode="lines+markers", name="pH Air",
             line=dict(color="#06d6a0", width=2), marker=dict(size=4),
-            hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>pH: %{y:.2f}<extra></extra>"
-        ))
-        fig_ph.add_hrect(
-            y0=6.5, y1=8.5,
-            fillcolor="rgba(6, 214, 160, 0.08)", line_width=0,
-            annotation_text="Rentang pH Ideal (6.5 - 8.5)",
-            annotation_position="top left", annotation_font_color="#06d6a0", annotation_font_size=11
-        )
-        fig_ph.update_layout(
-            title="Tingkat Keasaman Air (pH)",
-            paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
-            height=300, font=dict(color="#8da9c4"),
-            xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
-            yaxis=dict(gridcolor="#3a506b", title="pH", range=[4, 10]),
-            hovermode="x unified"
-        )
+            hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>pH: %{y:.2f}<extra></extra>"))
+        fig_ph.add_hrect(y0=6.5, y1=8.5, fillcolor="rgba(6, 214, 160, 0.08)", line_width=0,
+            annotation_text="Rentang pH Ideal (6.5 - 8.5)", annotation_position="top left", annotation_font_color="#06d6a0", annotation_font_size=11)
+        fig_ph.update_layout(title="Tingkat Keasaman Air (pH)", paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
+            height=300, font=dict(color="#8da9c4"), xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
+            yaxis=dict(gridcolor="#3a506b", title="pH", range=[4, 10]), hovermode="x unified")
         st.plotly_chart(fig_ph, use_container_width=True, key="chart_ph")
 
     # 3. Grafik Amonia NH3
     if "nh3" in history_df.columns and history_df["nh3"].notna().any():
         fig_nh3 = go.Figure()
-        fig_nh3.add_trace(go.Scatter(
-            x=x_axis, y=history_df["nh3"],
-            mode="lines+markers", name="Kadar Amonia (ppm)",
-            line=dict(color="#e71d36", width=2), marker=dict(size=4),
-            fill="tozeroy", fillcolor="rgba(231, 29, 54, 0.08)",
-            hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>NH3: %{y:.3f} ppm<extra></extra>"
-        ))
-        fig_nh3.add_hline(
-            y=0.10, line_dash="dash", line_color="#e71d36",
-            annotation_text="Batas Bahaya Amonia (> 0.10 ppm)",
-            annotation_position="top left", annotation_font_color="#e71d36"
-        )
-        fig_nh3.update_layout(
-            title="Kadar Gas Amonia (NH3) dalam ppm",
-            paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
-            height=300, font=dict(color="#8da9c4"),
-            xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
-            yaxis=dict(gridcolor="#3a506b", title="NH3 (ppm)"),
-            hovermode="x unified"
-        )
+        fig_nh3.add_trace(go.Scatter(x=x_axis, y=history_df["nh3"], mode="lines+markers", name="Kadar Amonia (ppm)",
+            line=dict(color="#e71d36", width=2), marker=dict(size=4), fill="tozeroy", fillcolor="rgba(231, 29, 54, 0.08)",
+            hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>NH3: %{y:.3f} ppm<extra></extra>"))
+        fig_nh3.add_hline(y=0.10, line_dash="dash", line_color="#e71d36",
+            annotation_text="Batas Bahaya Amonia (> 0.10 ppm)", annotation_position="top left", annotation_font_color="#e71d36")
+        fig_nh3.update_layout(title="Kadar Gas Amonia (NH3) dalam ppm", paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
+            height=300, font=dict(color="#8da9c4"), xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
+            yaxis=dict(gridcolor="#3a506b", title="NH3 (ppm)"), hovermode="x unified")
         st.plotly_chart(fig_nh3, use_container_width=True, key="chart_nh3")
 
     # 4. Grafik Kelembapan
     if "humi" in history_df.columns and history_df["humi"].notna().any():
         fig_humi = go.Figure()
-        fig_humi.add_trace(go.Scatter(
-            x=x_axis, y=history_df["humi"],
-            mode="lines", name="Kelembapan (%RH)",
-            line=dict(color="#118ab2", width=2),
-            hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>RH: %{y:.1f} %<extra></extra>"
-        ))
-        fig_humi.update_layout(
-            title="Kelembapan Lingkungan (%RH)",
-            paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
-            height=260, font=dict(color="#8da9c4"),
-            xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
-            yaxis=dict(gridcolor="#3a506b", title="Kelembapan (%)", range=[0, 100]),
-            hovermode="x unified"
-        )
+        fig_humi.add_trace(go.Scatter(x=x_axis, y=history_df["humi"], mode="lines", name="Kelembapan (%RH)",
+            line=dict(color="#118ab2", width=2), hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>RH: %{y:.1f} %<extra></extra>"))
+        fig_humi.update_layout(title="Kelembapan Lingkungan (%RH)", paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
+            height=260, font=dict(color="#8da9c4"), xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
+            yaxis=dict(gridcolor="#3a506b", title="Kelembapan (%)", range=[0, 100]), hovermode="x unified")
         st.plotly_chart(fig_humi, use_container_width=True, key="chart_humi")
 
     st.markdown("---")
@@ -506,7 +489,8 @@ else:
     if "firmware" in tabel_df.columns:      kolom_urut.append("firmware")
     if "firebase_key" in tabel_df.columns:  kolom_urut.append("firebase_key")
 
-    sisa_kolom = [c for c in tabel_df.columns if c not in kolom_urut and c not in ["waktu_wib", "ts"]]
+    # Abaikan kolom mentah yang sudah di-rename
+    sisa_kolom = [c for c in tabel_df.columns if c not in kolom_urut and c not in ["waktu_wib", "ts", "waktu", "suhu_c", "nh3_ppm"]]
     kolom_tampil = kolom_urut + sisa_kolom
 
     tabel_display = (
@@ -516,14 +500,9 @@ else:
     )
 
     rename_map = {
-        "temp": "Suhu (°C)",
-        "ph": "pH Air",
-        "nh3": "Amonia NH3 (ppm)",
-        "humi": "Kelembapan (%RH)",
-        "predicted_val": "Prediksi Suhu (°C)",
-        "status": "Status",
-        "firmware": "Firmware",
-        "firebase_key": "ID Data"
+        "temp": "Suhu (°C)", "ph": "pH Air", "nh3": "Amonia NH3 (ppm)",
+        "humi": "Kelembapan (%RH)", "predicted_val": "Prediksi Suhu (°C)",
+        "status": "Status", "firmware": "Firmware", "firebase_key": "ID Data"
     }
     tabel_display = tabel_display.rename(columns=rename_map)
 

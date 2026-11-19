@@ -6,6 +6,7 @@ Menampilkan data aktual yang diambil langsung dari Firebase:
 - /device/current   : Suhu, pH, Amonia (NH3), Kelembapan, Waktu, Firmware
 - /device/power     : Status daya perangkat (True / False)
 - /device/history   : Riwayat data sensor & hasil prediksi
++ Fitur Filter Rentang Waktu (Preset + Kalender Custom)
 ================================================================
 """
 
@@ -14,7 +15,7 @@ import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
 # ── Konfigurasi Kredensial Firebase ──────────────────────────
@@ -29,12 +30,10 @@ def get_firebase_credentials():
             return st.secrets["FIREBASE_URL"], st.secrets["FIREBASE_API_KEY"]
     except Exception:
         pass
-
     url = os.getenv("FIREBASE_URL", "")
     key = os.getenv("FIREBASE_API_KEY", "")
     if url and key:
         return url, key
-
     return _DEFAULT_URL, _DEFAULT_KEY
 
 FIREBASE_URL, FIREBASE_KEY = get_firebase_credentials()
@@ -77,6 +76,15 @@ st.markdown("""
         padding: 20px 24px;
         margin-bottom: 20px;
     }
+    .filter-banner {
+        background: rgba(72, 202, 228, 0.1);
+        border-left: 4px solid #48cae4;
+        border-radius: 8px;
+        padding: 10px 16px;
+        margin: 10px 0 16px 0;
+        color: #8da9c4;
+        font-size: 14px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -109,19 +117,16 @@ def ambil_data_firebase(limit_history=100):
     df_history   = pd.DataFrame()
 
     try:
-        # 1. Ambil data current
         url_current = f"{FIREBASE_URL}/device/current.json"
         res_curr = requests.get(url_current, params={"auth": FIREBASE_KEY}, timeout=10)
         if res_curr.status_code == 200:
             current_data = res_curr.json()
 
-        # 2. Ambil status power
         url_power = f"{FIREBASE_URL}/device/power.json"
         res_pow = requests.get(url_power, params={"auth": FIREBASE_KEY}, timeout=8)
         if res_pow.status_code == 200:
             power_data = res_pow.json()
 
-        # 3. Ambil data history
         url_hist = f"{FIREBASE_URL}/device/history.json"
         params_hist = {"auth": FIREBASE_KEY}
         if limit_history and limit_history > 0:
@@ -152,18 +157,94 @@ def ambil_data_firebase(limit_history=100):
         return None, None, None, f"Terjadi kesalahan: {str(e)}"
 
 
+# ── FUNGSI BARU: Filter Rentang Waktu ───────────────────────
+PRESET_OPSI = ["Semua Data", "Hari Ini", "7 Hari Terakhir", "30 Hari Terakhir", "Custom (Kalender)"]
+
+def filter_history(df, mode, picked_dates):
+    """
+    Filter history_df berdasarkan rentang waktu.
+    - mode: salah satu dari PRESET_OPSI
+    - picked_dates: tuple (start_date, end_date) dari st.date_input (mode Custom)
+    Mengembalikan DataFrame yang sudah difilter + label deskripsi rentang.
+    """
+    if df.empty or "waktu_wib" not in df.columns:
+        return df, "Tidak ada data waktu"
+
+    # Buang baris tanpa waktu valid
+    df = df.dropna(subset=["waktu_wib"]).copy()
+    if df.empty:
+        return df, "Tidak ada data waktu valid"
+
+    now_wib = pd.Timestamp.now(tz="Asia/Jakarta")
+    today_wib = now_wib.normalize()  # jam 00:00 hari ini WIB
+
+    if mode == "Semua Data":
+        return df, "Seluruh data riwayat"
+
+    if mode == "Hari Ini":
+        mask = df["waktu_wib"] >= today_wib
+        label = f"Hari ini ({today_wib.strftime('%d %b %Y')})"
+        return df[mask].reset_index(drop=True), label
+
+    if mode == "7 Hari Terakhir":
+        batas = today_wib - pd.Timedelta(days=6)
+        mask = df["waktu_wib"] >= batas
+        label = f"7 hari terakhir ({batas.strftime('%d %b')} → {today_wib.strftime('%d %b %Y')})"
+        return df[mask].reset_index(drop=True), label
+
+    if mode == "30 Hari Terakhir":
+        batas = today_wib - pd.Timedelta(days=29)
+        mask = df["waktu_wib"] >= batas
+        label = f"30 hari terakhir ({batas.strftime('%d %b')} → {today_wib.strftime('%d %b %Y')})"
+        return df[mask].reset_index(drop=True), label
+
+    if mode == "Custom (Kalender)":
+        if not isinstance(picked_dates, (tuple, list)) or len(picked_dates) != 2:
+            return df, "Pilih tanggal awal & akhir"
+        start_d, end_d = picked_dates
+        start_ts = pd.Timestamp(start_d, tz="Asia/Jakarta")
+        end_ts = pd.Timestamp(end_d, tz="Asia/Jakarta") + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        mask = (df["waktu_wib"] >= start_ts) & (df["waktu_wib"] <= end_ts)
+        label = f"Custom ({start_d.strftime('%d %b %Y')} → {end_d.strftime('%d %b %Y')})"
+        return df[mask].reset_index(drop=True), label
+
+    return df, "Seluruh data riwayat"
+
+
 # ── Sidebar Pengaturan ───────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Pengaturan Data")
     st.write("Dashboard ini menyajikan data langsung dari Firebase.")
-    
+
     limit_opsi = st.selectbox(
-        "Jumlah Baris Riwayat:",
+        "Jumlah Baris Riwayat Ditarik:",
         options=[50, 100, 200, 500, 1000, 2500],
-        index=1,
-        help="Berapa banyak data terakhir dari /device/history yang ingin ditarik."
+        index=2,
+        help="Berapa banyak data terakhir dari /device/history yang ingin ditarik dari Firebase."
     )
-    
+
+    st.markdown("---")
+    st.subheader("📅 Filter Rentang Waktu")
+    mode_filter = st.radio(
+        "Tampilkan data:",
+        options=PRESET_OPSI,
+        index=0,
+        help="Pilih preset cepat atau gunakan kalender untuk rentang custom."
+    )
+
+    picked_dates = None
+    if mode_filter == "Custom (Kalender)":
+        # Simpan pilihan kalender agar tidak reset saat auto-refresh
+        if "custom_range" not in st.session_state:
+            hari_ini = date.today()
+            st.session_state.custom_range = (hari_ini - timedelta(days=7), hari_ini)
+        picked_dates = st.date_input(
+            "Pilih tanggal (awal → akhir)",
+            value=st.session_state.custom_range,
+            max_value=date.today(),
+            key="custom_range"
+        )
+
     st.markdown("---")
     st.subheader("🌐 Info Koneksi")
     st.code(f"Database: {FIREBASE_URL.replace('https://', '') if FIREBASE_URL else 'Tidak ada'}", language="text")
@@ -184,7 +265,7 @@ with st.sidebar:
 
 
 # ── Mengambil Data ───────────────────────────────────────────
-current, power, history_df, error_msg = ambil_data_firebase(limit_history=limit_opsi)
+current, power, history_df_full, error_msg = ambil_data_firebase(limit_history=limit_opsi)
 
 # ── Header Dashboard ─────────────────────────────────────────
 st.markdown("""
@@ -200,12 +281,14 @@ if error_msg:
     st.error(f"❌ {error_msg}")
     st.stop()
 
-if not current and history_df.empty:
+if not current and history_df_full.empty:
     st.warning("⚠️ Belum ada data di node `/device` pada Firebase Anda.")
     st.stop()
 
+# ── Terapkan Filter Rentang Waktu ────────────────────────────
+history_df, rentang_label = filter_history(history_df_full, mode_filter, picked_dates)
 
-# ── Persiapan Data Terkini ───────────────────────────────────
+# ── Persiapan Data Terkini (tetap pakai /device/current, tidak terpengaruh filter) ─
 latest_temp = None
 latest_ph   = None
 latest_nh3  = None
@@ -227,8 +310,8 @@ if current:
         dt_curr = konversi_waktu(ts_val)
         latest_ts_str = dt_curr.strftime("%d %b %Y, %H:%M:%S WIB") if pd.notna(dt_curr) else str(ts_val)
 
-if not history_df.empty:
-    last_row = history_df.iloc[-1]
+if not history_df_full.empty:
+    last_row = history_df_full.iloc[-1]
     if latest_temp is None: latest_temp = last_row.get("temp")
     if latest_ph is None:   latest_ph   = last_row.get("ph")
     if latest_nh3 is None:  latest_nh3  = last_row.get("nh3")
@@ -238,88 +321,71 @@ if not history_df.empty:
     if latest_ts_str == "-" and "waktu_wib" in last_row:
         dt_last = last_row["waktu_wib"]
         latest_ts_str = dt_last.strftime("%d %b %Y, %H:%M:%S WIB") if pd.notna(dt_last) else "-"
-    
-    if "predicted_val" in history_df.columns:
-        df_with_pred = history_df.dropna(subset=["predicted_val"])
+
+    if "predicted_val" in history_df_full.columns:
+        df_with_pred = history_df_full.dropna(subset=["predicted_val"])
         if not df_with_pred.empty:
             latest_pred = df_with_pred.iloc[-1]["predicted_val"]
 
 # ── Baris Metrik Utama ───────────────────────────────────────
 st.subheader("📊 Data Sensor Terkini")
 
-# Tampilkan kolom sesuai sensor yang tersedia
-ada_ph  = latest_ph is not None or ("ph" in history_df.columns and history_df["ph"].notna().any())
-ada_nh3 = latest_nh3 is not None or ("nh3" in history_df.columns and history_df["nh3"].notna().any())
+ada_ph  = latest_ph is not None or ("ph" in history_df_full.columns and history_df_full["ph"].notna().any())
+ada_nh3 = latest_nh3 is not None or ("nh3" in history_df_full.columns and history_df_full["nh3"].notna().any())
 
 cols = st.columns(5)
-
 with cols[0]:
-    st.metric(
-        label="🌡️ Suhu Air",
-        value=f"{float(latest_temp):.2f} °C" if latest_temp is not None else "-"
-    )
-
+    st.metric(label="🌡️ Suhu Air",
+              value=f"{float(latest_temp):.2f} °C" if latest_temp is not None else "-")
 with cols[1]:
     if ada_ph:
-        st.metric(
-            label="🧪 Derajat Keasaman (pH)",
-            value=f"{float(latest_ph):.2f}" if latest_ph is not None else "-"
-        )
+        st.metric(label="🧪 Derajat Keasaman (pH)",
+                  value=f"{float(latest_ph):.2f}" if latest_ph is not None else "-")
     elif latest_humi is not None:
-        st.metric(
-            label="💧 Kelembapan",
-            value=f"{float(latest_humi):.1f} %"
-        )
+        st.metric(label="💧 Kelembapan", value=f"{float(latest_humi):.1f} %")
     else:
         st.metric(label="🧪 pH Air", value="-")
-
 with cols[2]:
     if ada_nh3:
-        st.metric(
-            label="💨 Amonia (NH3)",
-            value=f"{float(latest_nh3):.3f} ppm" if latest_nh3 is not None else "0.000 ppm"
-        )
+        st.metric(label="💨 Amonia (NH3)",
+                  value=f"{float(latest_nh3):.3f} ppm" if latest_nh3 is not None else "0.000 ppm")
     elif latest_pred is not None:
-        st.metric(
-            label="🔮 Prediksi Suhu",
-            value=f"{float(latest_pred):.2f} °C"
-        )
+        st.metric(label="🔮 Prediksi Suhu", value=f"{float(latest_pred):.2f} °C")
     else:
         st.metric(label="💨 Amonia (NH3)", value="-")
-
 with cols[3]:
     kondisi_label = latest_status if latest_status else "Normal"
-    st.metric(
-        label="⚡ Status Kondisi Air",
-        value=str(kondisi_label)
-    )
-
+    st.metric(label="⚡ Status Kondisi Air", value=str(kondisi_label))
 with cols[4]:
     power_label = "AKTIF (ON)" if power is True else ("MATI (OFF)" if power is False else "AKTIF")
-    st.metric(
-        label="🔌 Status Perangkat",
-        value=power_label
-    )
+    st.metric(label="🔌 Status Perangkat", value=power_label)
 
-# Info Waktu dan Firmware
 col_info1, col_info2, col_info3 = st.columns([2, 1, 1])
 with col_info1:
     st.caption(f"🕒 Waktu Update Terakhir: **{latest_ts_str}**")
 with col_info2:
     st.caption(f"📦 Versi Firmware: **{latest_firmware}**")
 with col_info3:
-    st.caption(f"📈 Total Data Riwayat: **{len(history_df)} Baris**")
+    st.caption(f"📈 Total Data Ditarik: **{len(history_df_full)} Baris**")
 
 st.markdown("---")
 
+# ── Banner Filter Aktif ──────────────────────────────────────
+st.markdown(
+    f'<div class="filter-banner">📅 <b>Filter Aktif:</b> {rentang_label} &nbsp;•&nbsp; '
+    f'<b>{len(history_df)}</b> baris ditampilkan dari total <b>{len(history_df_full)}</b> baris.</div>',
+    unsafe_allow_html=True
+)
 
-# ── Grafik Riwayat ───────────────────────────────────────────
-if not history_df.empty:
-    st.subheader(f"📈 Grafik Riwayat Parameter ({len(history_df)} Titik Terakhir)")
-    x_axis = history_df["waktu_wib"] if "waktu_wib" in history_df.columns else history_df.index
+# ── Grafik Riwayat (mengikuti filter) ────────────────────────
+if history_df.empty:
+    st.info("ℹ️ Tidak ada data pada rentang waktu yang dipilih. Coba ubah filter di sidebar.", icon="📅")
+else:
+    st.subheader(f"📈 Grafik Riwayat Parameter ({len(history_df)} Titik — {rentang_label})")
+    x_axis = history_df["waktu_wib"]
 
     # 1. Grafik Suhu
-    if "temp" in history_df.columns:
+    if "temp" in history_df.columns and history_df["temp"].notna().any():
         fig_temp = go.Figure()
         fig_temp.add_trace(go.Scatter(
             x=x_axis, y=history_df["temp"],
@@ -327,17 +393,14 @@ if not history_df.empty:
             line=dict(color="#48cae4", width=2), marker=dict(size=4),
             hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>Suhu: %{y:.2f} °C<extra></extra>"
         ))
-        
         if "predicted_val" in history_df.columns and history_df["predicted_val"].notna().any():
             df_pred_plot = history_df.dropna(subset=["predicted_val"])
-            x_p = df_pred_plot["waktu_wib"] if "waktu_wib" in df_pred_plot.columns else df_pred_plot.index
             fig_temp.add_trace(go.Scatter(
-                x=x_p, y=df_pred_plot["predicted_val"],
+                x=df_pred_plot["waktu_wib"], y=df_pred_plot["predicted_val"],
                 mode="lines", name="Prediksi Suhu (°C)",
                 line=dict(color="#f77f00", width=2, dash="dash"),
                 hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>Prediksi: %{y:.2f} °C<extra></extra>"
             ))
-
         fig_temp.add_hrect(
             y0=28.0, y1=33.0,
             fillcolor="rgba(46, 196, 182, 0.08)", line_width=0,
@@ -352,9 +415,9 @@ if not history_df.empty:
             yaxis=dict(gridcolor="#3a506b", title="Suhu (°C)"),
             hovermode="x unified"
         )
-        st.plotly_chart(fig_temp, use_container_width=True)
+        st.plotly_chart(fig_temp, use_container_width=True, key="chart_temp")
 
-    # 2. Grafik pH (jika ada)
+    # 2. Grafik pH
     if "ph" in history_df.columns and history_df["ph"].notna().any():
         fig_ph = go.Figure()
         fig_ph.add_trace(go.Scatter(
@@ -377,9 +440,9 @@ if not history_df.empty:
             yaxis=dict(gridcolor="#3a506b", title="pH", range=[4, 10]),
             hovermode="x unified"
         )
-        st.plotly_chart(fig_ph, use_container_width=True)
+        st.plotly_chart(fig_ph, use_container_width=True, key="chart_ph")
 
-    # 3. Grafik Amonia NH3 (jika ada)
+    # 3. Grafik Amonia NH3
     if "nh3" in history_df.columns and history_df["nh3"].notna().any():
         fig_nh3 = go.Figure()
         fig_nh3.add_trace(go.Scatter(
@@ -402,9 +465,9 @@ if not history_df.empty:
             yaxis=dict(gridcolor="#3a506b", title="NH3 (ppm)"),
             hovermode="x unified"
         )
-        st.plotly_chart(fig_nh3, use_container_width=True)
+        st.plotly_chart(fig_nh3, use_container_width=True, key="chart_nh3")
 
-    # 4. Grafik Kelembapan (jika ada)
+    # 4. Grafik Kelembapan
     if "humi" in history_df.columns and history_df["humi"].notna().any():
         fig_humi = go.Figure()
         fig_humi.add_trace(go.Scatter(
@@ -421,32 +484,36 @@ if not history_df.empty:
             yaxis=dict(gridcolor="#3a506b", title="Kelembapan (%)", range=[0, 100]),
             hovermode="x unified"
         )
-        st.plotly_chart(fig_humi, use_container_width=True)
+        st.plotly_chart(fig_humi, use_container_width=True, key="chart_humi")
 
     st.markdown("---")
 
-    # ── Tabel Data Murni Firebase ────────────────────────────────
-    st.subheader("📋 Tabel Data Riwayat dari Firebase")
-    
+    # ── Tabel Data Riwayat (mengikuti filter) ────────────────
+    st.subheader(f"📋 Tabel Data Riwayat — {rentang_label}")
+
     tabel_df = history_df.copy()
     if "waktu_wib" in tabel_df.columns:
         tabel_df["Waktu (WIB)"] = tabel_df["waktu_wib"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
     kolom_urut = []
-    if "Waktu (WIB)" in tabel_df.columns:  kolom_urut.append("Waktu (WIB)")
-    if "temp" in tabel_df.columns:         kolom_urut.append("temp")
-    if "ph" in tabel_df.columns:           kolom_urut.append("ph")
-    if "nh3" in tabel_df.columns:          kolom_urut.append("nh3")
-    if "humi" in tabel_df.columns:         kolom_urut.append("humi")
-    if "predicted_val" in tabel_df.columns:kolom_urut.append("predicted_val")
-    if "status" in tabel_df.columns:       kolom_urut.append("status")
-    if "firmware" in tabel_df.columns:     kolom_urut.append("firmware")
-    if "firebase_key" in tabel_df.columns: kolom_urut.append("firebase_key")
+    if "Waktu (WIB)" in tabel_df.columns:   kolom_urut.append("Waktu (WIB)")
+    if "temp" in tabel_df.columns:          kolom_urut.append("temp")
+    if "ph" in tabel_df.columns:            kolom_urut.append("ph")
+    if "nh3" in tabel_df.columns:           kolom_urut.append("nh3")
+    if "humi" in tabel_df.columns:          kolom_urut.append("humi")
+    if "predicted_val" in tabel_df.columns: kolom_urut.append("predicted_val")
+    if "status" in tabel_df.columns:        kolom_urut.append("status")
+    if "firmware" in tabel_df.columns:      kolom_urut.append("firmware")
+    if "firebase_key" in tabel_df.columns:  kolom_urut.append("firebase_key")
 
     sisa_kolom = [c for c in tabel_df.columns if c not in kolom_urut and c not in ["waktu_wib", "ts"]]
     kolom_tampil = kolom_urut + sisa_kolom
 
-    tabel_display = tabel_df[kolom_tampil].sort_values("Waktu (WIB)", ascending=False) if "Waktu (WIB)" in tabel_df.columns else tabel_df.iloc[::-1]
+    tabel_display = (
+        tabel_df[kolom_tampil].sort_values("Waktu (WIB)", ascending=False)
+        if "Waktu (WIB)" in tabel_df.columns
+        else tabel_df[kolom_tampil].iloc[::-1]
+    )
 
     rename_map = {
         "temp": "Suhu (°C)",
@@ -466,7 +533,7 @@ if not history_df.empty:
     st.download_button(
         label="📥 Unduh Data Ini (CSV)",
         data=csv_bytes,
-        file_name=f"data_kolam_ikan_nila_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"data_kolam_{mode_filter.replace(' ', '_').replace('(', '').replace(')', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv"
     )
 

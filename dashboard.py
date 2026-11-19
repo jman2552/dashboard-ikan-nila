@@ -2,11 +2,12 @@
 ================================================================
 DASHBOARD MONITORING IKAN NILA — FIREBASE REALTIME
 ================================================================
-Menampilkan data aktual yang diambil langsung dari Firebase:
-- /device/current   : Suhu, pH, Amonia (NH3), Kelembapan, Waktu, Firmware
-- /device/power     : Status daya perangkat (True / False)
-- /device/history   : Riwayat data sensor & hasil prediksi
+Menampilkan data aktual dari Firebase:
+- /device/current  : Suhu, pH, Amonia (NH3), Kelembapan, Waktu, Firmware
+- /device/power    : Status daya perangkat (True / False)
+- /device/history  : Riwayat data sensor & hasil prediksi
 + Fitur Filter Rentang Waktu (Preset + Kalender Custom)
++ FIX: Timezone WIB (tidak double-convert)
 ================================================================
 """
 
@@ -91,23 +92,34 @@ st.markdown("""
 
 # ── Fungsi Pengambilan Data dari Firebase ───────────────────
 def konversi_waktu(ts_raw):
-    """Konversi timestamp epoch second/ms / ISO string ke format waktu lokal (WIB)."""
+    """
+    Konversi timestamp ke datetime WIB.
+    ✅ PERBAIKAN: String datetime dari ESP32 sudah dalam WIB,
+    jadi di-localize langsung ke Asia/Jakarta (TIDAK lewat UTC).
+    Hanya epoch integer yang dianggap UTC lalu dikonversi ke WIB.
+    """
     if pd.isna(ts_raw):
         return None
     try:
-        if isinstance(ts_raw, (int, float)) or (isinstance(ts_raw, str) and ts_raw.isdigit()):
+        # Kasus 1: epoch integer (detik/milidetik) -> UTC -> WIB
+        if isinstance(ts_raw, (int, float)) or (isinstance(ts_raw, str) and ts_raw.replace('.', '', 1).isdigit()):
             ts_int = int(ts_raw)
             unit = "ms" if ts_int > 1e11 else "s"
             return pd.to_datetime(ts_int, unit=unit, utc=True).tz_convert("Asia/Jakarta")
+        # Kasus 2: string datetime (mis. "2026-11-19 17:35:18") -> sudah WIB
         dt = pd.to_datetime(ts_raw, errors="coerce")
+        if pd.isna(dt):
+            return None
         if dt.tzinfo is None:
-            return dt.tz_localize("UTC").tz_convert("Asia/Jakarta")
+            # ✅ LANGSUNG localize sebagai WIB (jangan lewat UTC!)
+            return dt.tz_localize("Asia/Jakarta")
         return dt.tz_convert("Asia/Jakarta")
     except Exception:
         return pd.to_datetime(ts_raw, errors="coerce")
 
+
 def decode_firebase_push_key_timestamp(push_key):
-    """Decode timestamp tersembunyi dari Firebase push key (8 karakter pertama = epoch ms)."""
+    """Decode timestamp dari Firebase push key (8 karakter pertama = epoch ms)."""
     if not push_key or not isinstance(push_key, str) or len(push_key) < 8:
         return None
     try:
@@ -165,7 +177,7 @@ def ambil_data_firebase(limit_history=100):
                 if rows:
                     df_history = pd.DataFrame(rows)
 
-                    # ── NORMALISASI NAMA KOLOM (sesuai data Firebase Anda) ──
+                    # ── Normalisasi nama kolom (suhu_c -> temp, nh3_ppm -> nh3) ──
                     rename_map = {}
                     if "suhu_c" in df_history.columns:
                         rename_map["suhu_c"] = "temp"
@@ -174,7 +186,7 @@ def ambil_data_firebase(limit_history=100):
                     if rename_map:
                         df_history = df_history.rename(columns=rename_map)
 
-                    # ── BUAT KOLOM waktu_wib DARI BEBERAPA SUMBER ──
+                    # ── Buat kolom waktu_wib ──
                     timestamp_found = False
                     for col_name in ["ts", "waktu", "timestamp", "time", "created_at"]:
                         if col_name in df_history.columns:
@@ -183,12 +195,10 @@ def ambil_data_firebase(limit_history=100):
                             break
 
                     if not timestamp_found:
-                        # Fallback: decode dari Firebase push key
                         df_history["waktu_wib"] = df_history["firebase_key"].apply(
                             decode_firebase_push_key_timestamp
                         )
 
-                    # Sort berdasarkan waktu
                     df_history = df_history.sort_values("waktu_wib").reset_index(drop=True)
 
         return current_data, power_data, df_history, None
@@ -199,7 +209,7 @@ def ambil_data_firebase(limit_history=100):
         return None, None, None, f"Terjadi kesalahan: {str(e)}"
 
 
-# ── FUNGSI BARU: Filter Rentang Waktu ───────────────────────
+# ── Filter Rentang Waktu ────────────────────────────────────
 PRESET_OPSI = ["Semua Data", "Hari Ini", "7 Hari Terakhir", "30 Hari Terakhir", "Custom (Kalender)"]
 
 def filter_history(df, mode, picked_dates):
@@ -427,7 +437,8 @@ else:
                 hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>Prediksi: %{y:.2f} °C<extra></extra>"
             ))
         fig_temp.add_hrect(y0=28.0, y1=33.0, fillcolor="rgba(46, 196, 182, 0.08)", line_width=0,
-            annotation_text="Rentang Suhu Ideal (28°C - 33°C)", annotation_position="top left", annotation_font_color="#2ec4b6", annotation_font_size=11)
+            annotation_text="Rentang Suhu Ideal (28°C - 33°C)", annotation_position="top left",
+            annotation_font_color="#2ec4b6", annotation_font_size=11)
         fig_temp.update_layout(title="Dinamika Suhu Kolam (°C)", paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
             height=320, font=dict(color="#8da9c4"), xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
             yaxis=dict(gridcolor="#3a506b", title="Suhu (°C)"), hovermode="x unified")
@@ -440,7 +451,8 @@ else:
             line=dict(color="#06d6a0", width=2), marker=dict(size=4),
             hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>pH: %{y:.2f}<extra></extra>"))
         fig_ph.add_hrect(y0=6.5, y1=8.5, fillcolor="rgba(6, 214, 160, 0.08)", line_width=0,
-            annotation_text="Rentang pH Ideal (6.5 - 8.5)", annotation_position="top left", annotation_font_color="#06d6a0", annotation_font_size=11)
+            annotation_text="Rentang pH Ideal (6.5 - 8.5)", annotation_position="top left",
+            annotation_font_color="#06d6a0", annotation_font_size=11)
         fig_ph.update_layout(title="Tingkat Keasaman Air (pH)", paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
             height=300, font=dict(color="#8da9c4"), xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
             yaxis=dict(gridcolor="#3a506b", title="pH", range=[4, 10]), hovermode="x unified")
@@ -463,7 +475,8 @@ else:
     if "humi" in history_df.columns and history_df["humi"].notna().any():
         fig_humi = go.Figure()
         fig_humi.add_trace(go.Scatter(x=x_axis, y=history_df["humi"], mode="lines", name="Kelembapan (%RH)",
-            line=dict(color="#118ab2", width=2), hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>RH: %{y:.1f} %<extra></extra>"))
+            line=dict(color="#118ab2", width=2),
+            hovertemplate="<b>%{x|%d/%m/%Y %H:%M}</b><br>RH: %{y:.1f} %<extra></extra>"))
         fig_humi.update_layout(title="Kelembapan Lingkungan (%RH)", paper_bgcolor="#0b132b", plot_bgcolor="#1c2541",
             height=260, font=dict(color="#8da9c4"), xaxis=dict(gridcolor="#3a506b", title="Waktu (WIB)"),
             yaxis=dict(gridcolor="#3a506b", title="Kelembapan (%)", range=[0, 100]), hovermode="x unified")
@@ -489,7 +502,6 @@ else:
     if "firmware" in tabel_df.columns:      kolom_urut.append("firmware")
     if "firebase_key" in tabel_df.columns:  kolom_urut.append("firebase_key")
 
-    # Abaikan kolom mentah yang sudah di-rename
     sisa_kolom = [c for c in tabel_df.columns if c not in kolom_urut and c not in ["waktu_wib", "ts", "waktu", "suhu_c", "nh3_ppm"]]
     kolom_tampil = kolom_urut + sisa_kolom
 
